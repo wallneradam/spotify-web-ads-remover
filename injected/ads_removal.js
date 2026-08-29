@@ -22,6 +22,8 @@ startObserving();
 
 document.dispatchEvent(new CustomEvent('updateCounter', {detail: 0}));
 
+var statesManipuationQueue = new PromiseQueue();
+
 
 //
 // Hook the fetch() function.
@@ -32,6 +34,7 @@ window.fetch = function(url, init)
 
     if (url != undefined && url.includes("/state"))
     {
+
         if (init.headers["authorization"])
             authorizationHeader = init.headers["authorization"];
         if (init.headers["client-token"])
@@ -51,12 +54,18 @@ window.fetch = function(url, init)
             init.body = JSON.stringify(request);
         }
 
-        return originalFetch.call(window, url, init).then(function(response)
+        var promise = async function(fetchArguments) {
+
+        return originalFetch.call(window, fetchArguments.url, fetchArguments.init).then(function(response)
         {
             // TODO: what do we do  on 429 here?
             var modifiedResponse = onStatesFetchResponseReceived(url, init, response);
             return modifiedResponse;
         });
+
+        };
+
+        return statesManipuationQueue.enqueue(promise, {url: url, init: init});
     }
     else if (url != undefined && url.endsWith("/devices"))
     {
@@ -109,10 +118,13 @@ async function onAccessTokenResponseIntercepted(accessTokenResponse)
 //
 wsHook.after = function(messageEvent, url) 
 {
-    return new Promise(async function(resolve, reject)
+    var promise = async function(messageEvent) {
+
+    try
     {
+        
         var data = JSON.parse(messageEvent.data);
-        if (data.payloads == undefined) {resolve(messageEvent); return;}
+        if (data.payloads == undefined) {return messageEvent;}
 
         for (var i = 0; i < data.payloads.length; i++)
         {
@@ -124,13 +136,18 @@ wsHook.after = function(messageEvent, url)
                 if (stateRef != null) 
                 {
                     var currentStateIndex = stateRef["state_index"];
-    
-                    payload["state_machine"] = await manipulateStateMachine(stateMachine, currentStateIndex, true);
+
+                    //console.log("SpotiAds: Received state machine over WebSocket, manipulating it");
+
+                    // TODO: it's possible that payload["prev_state_ref"] will be different that the current state machine, states will be rejected,
+                    //       which will cause Spotify to request /state_conflict. see _rejectState(). Is it our fault?
+
+                    payload["state_machine"] = await manipulateStateMachine(stateMachine, currentStateIndex, true, "web_socket_replace_state");
                     data.payloads[i] = payload;
-    
+
                     isWebScoketInterceptionWorking = true;
                 }
-    
+
                 if (isSimulatingStateChnage) 
                 {
                     // Block this notification from reaching the client, to prevent song change.
@@ -139,6 +156,7 @@ wsHook.after = function(messageEvent, url)
             }
             else if (payload.cluster != undefined)
             {
+                // _onClusterMessage ?
                 if (payload.update_reason == "DEVICE_STATE_CHANGED")
                 {
                     if (deviceId != payload.cluster.active_device_id)
@@ -163,8 +181,17 @@ wsHook.after = function(messageEvent, url)
 
         messageEvent.data = JSON.stringify(data);
 
-        resolve(messageEvent);
-    });
+        return messageEvent;
+    }
+    catch(exception)
+    {
+        console.log(exception);
+        return messageEvent;
+    }
+
+    };
+
+    return statesManipuationQueue.enqueue(promise, messageEvent);
 }
 
 function onStatesFetchResponseReceived(url, init, responseBody)
@@ -173,55 +200,81 @@ function onStatesFetchResponseReceived(url, init, responseBody)
     var request = JSON.parse(requestBody);
 
     var originalJsonPromise = responseBody.json();
-    responseBody.json = function()
+    responseBody.json = function(request)
     {
+        var promise = async function() {
+        
         return originalJsonPromise.then(async function(data)
         {
             var stateMachine = data["state_machine"];           
             var updatedStateRef = data["updated_state_ref"];    
 
-            var commands = data["commands"]; // for /state_conflict
-            if (commands != null)
+            var commands = data["commands"];
+            if (commands == null)
             {
+                // for regular /state update request
+                // _updateState
+
+                if (stateMachine == undefined || updatedStateRef == null) return data;
+
+                var currentStateIndex = updatedStateRef["state_index"];
+                var debug_source = request["debug_source"];
+    
+                data["state_machine"] = await manipulateStateMachine(stateMachine, currentStateIndex, false, debug_source);
+    
+                isFetchInterceptionWorking = true;
+            }
+            else
+            {
+                 // for /state_conflict
+                 // _rejectState
+
+                console.log("SpotiAds: We see /state_conflict");
                 for (var key of Object.keys(commands))
                 {
                     var stateMachine = data["commands"][key]["state_machine"];           
                     var currentStateIndex = data["commands"][key]["state_ref"]["state_index"];
 
-                    data["commands"][key]["state_machine"] = await manipulateStateMachine(stateMachine, currentStateIndex, false);
+                    
+                    // TODO: it's possible that data["commands"][key]["prev_state_ref"] will be different that the current state machine, states will be rejected,
+                    //       which will cause Spotify to request /state_conflict. see _rejectState(). Is it our fault?
+
+                    data["commands"][key]["state_machine"] = await manipulateStateMachine(stateMachine, currentStateIndex, false, "state_conflict_replace_state_command");
         
                     isFetchInterceptionWorking = true;
 
                 }
             }
-            else
-            {
-                if (stateMachine == undefined || updatedStateRef == null) return data;
-
-                var currentStateIndex = updatedStateRef["state_index"];
-    
-                data["state_machine"] = await manipulateStateMachine(stateMachine, currentStateIndex, false);
-    
-                isFetchInterceptionWorking = true;
-            }
+            
             return data;
 
         }).catch(function(reason)
         {
             console.error(reason);
+            return originalJsonPromise;
         });
-    };
+
+        };
+
+        return statesManipuationQueue.enqueue(promise, null);
+
+    }.bind(this, request);
     
     return responseBody;
 }
 
-async function manipulateStateMachine(stateMachine, startingStateIndex, isReplacingState)
+async function manipulateStateMachine(stateMachine, startingStateIndex, isReplacingState, debug_source="")
 {
-    
+    var didRequestFutureStates = false;
+
     do
     {
         var removedAds = false;
-        console.log("SpotiAds: We see state machine: " + getStateMachineDestripction(stateMachine) + " (state machine id: " + stateMachine["state_machine_id"] + ")");
+
+        var originalStateMachineId = stateMachine["state_machine_id"];
+        var originalStateId = stateMachine["states"][startingStateIndex]["state_id"];
+        
+        console.log("SpotiAds: We see state machine: " + getStateMachineDestripction(stateMachine) + " (state machine id: " + stateMachine["state_machine_id"] + ", source:" + debug_source + ")");
 
         for (var i = 0; i < stateMachine["states"].length; i++)
         {
@@ -272,14 +325,14 @@ async function manipulateStateMachine(stateMachine, startingStateIndex, isReplac
                             stateMachine = fixedStateMachine;
 
                                 
-                            // if (i == startingStateIndex && !isReplacingState) 
-                            // {
-                            //     // Our new state is going to be played now, let's point the player at the future state machine.
-                            //     newState["state_id"] = originalNextStateId;
-                            //     stateMachine["state_machine_id"] = futureStateMachine["state_machine_id"];
+                            if (i == startingStateIndex && !isReplacingState) 
+                            {
+                                // Our new state is going to be played now, let's point the player at the future state machine.
+                                newState["state_id"] = originalNextStateId;
+                                stateMachine["state_machine_id"] = futureStateMachine["state_machine_id"];
 
-                            //     console.log("SpotifyAdRemover: Removed ad at " + trackURI + ", more complex flow");
-                            // }
+                                console.log("SpotifyAdRemover: Removed ad at " + trackURI + ", more complex flow");
+                            }
                         }
                         else
                         {
@@ -296,6 +349,8 @@ async function manipulateStateMachine(stateMachine, startingStateIndex, isReplac
                         console.error(exception);
                         console.error(exception.stack);
                     }
+
+                    didRequestFutureStates = true;
                 }
                 else
                 {
@@ -330,6 +385,17 @@ async function manipulateStateMachine(stateMachine, startingStateIndex, isReplac
                         newState["disallow_seeking"] = false;
                         newState["restrictions"] = {};
                     }
+
+                    if (i == startingStateIndex && !isReplacingState) 
+                    {
+                        // Our new state is going to be played now, let's point the player at the future state machine.
+                        newState["state_id"] = originalNextStateId;
+                        stateMachine["state_machine_id"] = futureStateMachine["state_machine_id"];
+
+                        console.log("SpotifyAdRemover: Removed ad at " + trackURI + ", more complex flow (2)");
+                    }
+
+                    didRequestFutureStates = true;
                     
                 }
 
@@ -367,6 +433,13 @@ async function manipulateStateMachine(stateMachine, startingStateIndex, isReplac
     stateMachine = tryToRemoveAdTracks(stateMachine);
 
     currentTracks = stateMachine["tracks"];
+
+    if (didRequestFutureStates && debug_source != "")
+    {
+        // make the original states request again to update the state to the original
+        console.log("SpotiAds: Putting the state machine back to the original state");
+        getStates(originalStateMachineId, originalStateId);
+    }
 
     return stateMachine;
 }
@@ -647,7 +720,7 @@ function tryToRemoveAdTracks(stateMachine)
     {
         if (isAdTrack(tracks[i]))
         {
-            console.log("SpotiAds: trying to remove ad track " + tracks[i]["metadata"]["uri"]);
+            //console.log("SpotiAds: trying to remove ad track " + tracks[i]["metadata"]["uri"]);
             //debugger;
             tracks[i] = null;
         }

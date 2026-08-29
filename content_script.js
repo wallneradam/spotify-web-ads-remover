@@ -6,6 +6,7 @@ async function injectOtherScripts()
 {
 	await injectScript('injected/ws_hook.js');
 	await injectScript('lib/moduleraid.js');
+	await injectScript('injected/utils.js');
 	await injectScript('injected/ads_removal.js');
 	await injectScript('lib/sweetalert.min.js');
 }

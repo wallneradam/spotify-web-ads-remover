@@ -15,3 +15,6 @@ No data is ever transmitted to anywhere. No backend, no analytics, no server.
 
 You can find the privacy policy [here](https://github.com/tomer8007/spotify-web-ads-remover/wiki/Chrome-Extension-Privacy-Policy).
 
+## Other notices
+There is the competing Blockify extension, which started as a fork of this project. Its [ads_removal.js](https://github.com/dhanur2/blockify-browser-extension/blob/main/injected/ads_removal.js) is mostly the same as the original [ads_removal.js](https://github.com/tomer8007/spotify-web-ads-remover/blob/3a9f5aca9886c3e2868d4133537d492bab137c5d/injected/ads_removal.js) here. Also its [AdsRemovalV1.js](https://github.com/dhanur2/blockify-browser-extension/blob/14308602c93ed2974190bbeca38f0edb3b90b493/injected/adsRemovalV1.js) still relies on `/states` and Websocket `replace_state` interception.
+

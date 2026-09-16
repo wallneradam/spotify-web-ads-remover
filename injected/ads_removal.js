@@ -413,7 +413,25 @@ async function manipulateStateMachine(stateMachine, startingStateIndex, isReplac
                     [futureStateMachine, stateRef] = await getStates(stateMachine["state_machine_id"], newState["state_id"]);
                     if (futureStateMachine != null)
                     {
-                        newState = futureStateMachine["states"][stateRef["state_index"]];
+                        var expectedTrackURI = stateMachine["tracks"][newState["track"]]["metadata"]["uri"];
+                        var referencedState = futureStateMachine["states"][stateRef["state_index"]];
+                        var matchingState = futureStateMachine["states"].find(function(candidateState) {
+                            var candidateTrack = futureStateMachine["tracks"][candidateState["track"]];
+                            return candidateTrack != null && candidateTrack["metadata"]["uri"] == expectedTrackURI;
+                        });
+                        if (matchingState != null)
+                        {
+                            if (matchingState !== referencedState)
+                            {
+                                console.warn("SpotifyAdRemover: Corrected a drifting future state index for " + expectedTrackURI);
+                            }
+                            newState = matchingState;
+                        }
+                        else
+                        {
+                            console.warn("SpotifyAdRemover: Expected future track was absent; retaining Spotify's referenced state for " + expectedTrackURI);
+                            newState = referencedState;
+                        }
                         
                         console.log("Spotiads: Inserting fixed track with transitions from future state machine");
                         var wantedStateId = state["state_id"];

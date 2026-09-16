@@ -1,3 +1,5 @@
+var spotifyAdRemoverCompatibility = "track-uri-v1+non-ad-fast-path-v1+no-state-restore-v1";
+
 var currentTracks = [];
 var removedAdsList = [];
 var tamperedStatesMap = {};
@@ -23,6 +25,56 @@ startObserving();
 document.dispatchEvent(new CustomEvent('updateCounter', {detail: 0}));
 
 var statesManipuationQueue = new PromiseQueue();
+
+function stateMachineNeedsFiltering(stateMachine)
+{
+    if (stateMachine == null) return false;
+    if (Array.isArray(stateMachine["tracks"]) && stateMachine["tracks"].some(isAdTrack)) return true;
+    return Array.isArray(stateMachine["states"]) && stateMachine["states"].some(function(state) {
+        return state != null && tamperedStatesMap[getFutureStateId(state["state_id"])] != null;
+    });
+}
+
+function stateResponseNeedsFiltering(data)
+{
+    if (stateMachineNeedsFiltering(data == null ? null : data["state_machine"])) return true;
+    var commands = data == null ? null : data["commands"];
+    return commands != null && Object.keys(commands).some(function(key) {
+        return stateMachineNeedsFiltering(commands[key]["state_machine"]);
+    });
+}
+
+function webSocketMessageNeedsFiltering(messageEvent)
+{
+    try
+    {
+        var data = JSON.parse(messageEvent.data);
+        if (!Array.isArray(data.payloads)) return false;
+        return data.payloads.some(function(payload) {
+            if (payload == null) return false;
+            if (payload.type == "replace_state")
+            {
+                var needsFiltering = stateMachineNeedsFiltering(payload["state_machine"]);
+                if (!needsFiltering && payload["state_machine"] != null && payload["state_ref"] != null)
+                {
+                    console.log("SpotiAds: Passing through state machine: "
+                        + getStateMachineDestripction(payload["state_machine"], payload["state_ref"]["state_index"])
+                        + " (state machine id: " + payload["state_machine"]["state_machine_id"]
+                        + ", source:web_socket_fast_path)");
+                }
+                return needsFiltering;
+            }
+            var track = payload.cluster == null || payload.cluster.player_state == null
+                ? null
+                : payload.cluster.player_state.track;
+            return isAdTrack(track);
+        });
+    }
+    catch
+    {
+        return false;
+    }
+}
 
 
 //
@@ -64,7 +116,7 @@ window.fetch = function(url, init)
 
         };
 
-        return statesManipuationQueue.enqueue(promise, {url: url, init: init});
+        return promise({url: url, init: init});
     }
     else if (url != undefined && url.endsWith("/devices"))
     {
@@ -95,7 +147,7 @@ window.fetch = function(url, init)
         return originalFetch.call(window, fetchArguments.url, fetchArguments.init);
         
         }
-        return statesManipuationQueue.enqueue(promise, {url: url, init: init});
+        return promise({url: url, init: init});
 
     }
     else if (url.includes("/license"))
@@ -136,6 +188,7 @@ async function onAccessTokenResponseIntercepted(accessTokenResponse)
 //
 wsHook.after = function(messageEvent, url) 
 {
+    if (!webSocketMessageNeedsFiltering(messageEvent)) return Promise.resolve(messageEvent);
     var promise = async function(messageEvent) {
 
     try
@@ -233,6 +286,31 @@ function onStatesFetchResponseReceived(url, init, responseBody)
             var updatedStateRef = data["updated_state_ref"];    
 
             var commands = data["commands"];
+            if (!stateResponseNeedsFiltering(data))
+            {
+                if (commands != null)
+                {
+                    console.log("SpotiAds: Passing through non-ad state conflict without manipulation. rejected_state_refs: "
+                        + (request["rejected_state_refs"] || []).map(function(ref) { return ref["state_machine_id"]; }).join(" ")
+                        + ", current state_machine_id: " + (request["state_ref"] == null ? "" : request["state_ref"]["state_machine_id"]));
+                    Object.keys(commands).forEach(function(key) {
+                        var command = commands[key];
+                        if (command["type"] != "replace_state" || command["state_machine"] == null || command["state_ref"] == null) return;
+                        console.log("SpotiAds: Passing through state machine: "
+                            + getStateMachineDestripction(command["state_machine"], command["state_ref"]["state_index"])
+                            + " (state machine id: " + command["state_machine"]["state_machine_id"]
+                            + ", source:state_conflict_fast_path)");
+                    });
+                }
+                else if (data["state_machine"] != null && data["updated_state_ref"] != null)
+                {
+                    console.log("SpotiAds: Passing through state machine: "
+                        + getStateMachineDestripction(data["state_machine"], data["updated_state_ref"]["state_index"])
+                        + " (state machine id: " + data["state_machine"]["state_machine_id"]
+                        + ", source:" + (request["debug_source"] || "state_fast_path") + ")");
+                }
+                return data;
+            }
             if (commands == null)
             {
                 // for regular /state update request

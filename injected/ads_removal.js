@@ -315,8 +315,6 @@ async function manipulateStateMachine(stateMachine, startingStateIndex, isReplac
     {
         var removedAds = false;
 
-        var originalStateMachineId = stateMachine["state_machine_id"];
-        var originalStateId = stateMachine["states"][startingStateIndex]["state_id"];
         
         console.log("SpotiAds: We see state machine: " + getStateMachineDestripction(stateMachine) + " (state machine id: " + stateMachine["state_machine_id"] + ", source:" + debug_source + ")");
 
@@ -498,9 +496,7 @@ async function manipulateStateMachine(stateMachine, startingStateIndex, isReplac
 
     if (didRequestFutureStates)
     {
-        // make the original states request again to update the state to the original
-        console.log("SpotiAds: Putting the state machine back to the original state");
-        getStates(originalStateMachineId, originalStateId);
+        console.log("SpotiAds: Keeping the ad-free future state machine active");
     }
 
     return stateMachine;

@@ -15,7 +15,7 @@ function load() {
         CustomEvent: class {},
         MessageEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
         document: { documentElement: {}, dispatchEvent() {} },
-        setTimeout() {},
+        setTimeout(callback, delay = 0) { if (delay === 0) return setTimeout(callback, 0); },
         clearTimeout,
         window: { fetch(url, init) {
             calls.push({ url, init });
@@ -43,7 +43,7 @@ const replacementEvent = value => ({ data: JSON.stringify({ payloads: [{
     type: 'replace_state', state_machine: value, state_ref: { state_index: 0 }
 }] }) });
 
-test('ordinary WebSocket updates bypass a pending ad operation unchanged', async () => {
+test('ordinary playback replacements wait for a pending ad operation unchanged', async () => {
     const { context } = load();
     let release;
     const pending = context.statesManipuationQueue.enqueue(() => new Promise(resolve => { release = resolve; }));
@@ -52,12 +52,202 @@ test('ordinary WebSocket updates bypass a pending ad operation unchanged', async
     const result = context.wsHook.after(event).then(value => { delivered = value; });
     try {
         await nextTurn();
-        assert.equal(delivered, event);
+        assert.equal(delivered, undefined);
     } finally {
         release();
         await pending;
         await result;
     }
+    assert.equal(delivered, event);
+});
+
+test('non-playback socket traffic remains available during a pending state operation', async () => {
+    const { context } = load();
+    let release;
+    const pending = context.statesManipuationQueue.enqueue(() => new Promise(resolve => { release = resolve; }));
+    const event = { data: '{"type":"pong"}' };
+    try {
+        assert.equal(await context.wsHook.after(event), event);
+        assert.equal(event.data, '{"type":"pong"}');
+    } finally {
+        release();
+        await pending;
+    }
+});
+
+test('a clean replacement cannot overtake an earlier delayed ad replacement', async () => {
+    const { context } = load();
+    let release;
+    const delivery = [];
+    context.manipulateStateMachine = async value => {
+        await new Promise(resolve => { release = resolve; });
+        return value;
+    };
+    const ad = context.wsHook.after(replacementEvent(machine('spotify:ad:pending'))).then(() => delivery.push('ad'));
+    await nextTurn();
+    const clean = context.wsHook.after(replacementEvent(machine())).then(() => delivery.push('clean'));
+    try {
+        await nextTurn();
+        assert.deepEqual(delivery, []);
+    } finally {
+        release();
+        await Promise.all([ad, clean]);
+    }
+    assert.deepEqual(delivery, ['ad', 'clean']);
+});
+
+test('a second state request and socket replacement wait for first response processing', async () => {
+    const { context } = load();
+    const requests = [];
+    let release;
+    let transforms = 0;
+    const data = { state_machine: machine('spotify:ad:pending'), updated_state_ref: { state_index: 0 } };
+    context.originalFetch = async (url, init) => {
+        requests.push(JSON.parse(init.body).debug_source);
+        return { status: 200, json: async () => structuredClone(data) };
+    };
+    context.manipulateStateMachine = async value => {
+        if (++transforms === 1) await new Promise(resolve => { release = resolve; });
+        return value;
+    };
+    const init = source => ({ headers: {}, body: JSON.stringify({ state_ref: null, debug_source: source }) });
+    const first = context.window.fetch('https://example.test/state', init('first')).then(response => response.json());
+    await nextTurn();
+    const second = context.window.fetch('https://example.test/state', init('second')).then(response => response.json());
+    let delivered = false;
+    const socket = context.wsHook.after(replacementEvent(machine())).then(() => { delivered = true; });
+    try {
+        await nextTurn();
+        assert.deepEqual(requests, ['first']);
+        assert.equal(delivered, false);
+    } finally {
+        release();
+        await Promise.all([first, second, socket]);
+    }
+    assert.deepEqual(requests, ['first', 'second']);
+    assert.equal(delivered, true);
+});
+
+test('the SDK consumes a state response before the following socket replacement is delivered', async () => {
+    const { context } = load();
+    const requested = { state_machine_id: 'old', state_id: 'old', paused: false };
+    const firstMachine = machine();
+    firstMachine.state_machine_id = 'first';
+    let sdkRef = requested;
+    const delivery = [];
+    context.originalFetch = async () => ({ status: 200, json: async () => ({
+        state_machine: firstMachine, updated_state_ref: { state_index: 0, paused: false }
+    }) });
+    const first = context.window.fetch('https://example.test/state', { headers: {},
+        body: JSON.stringify({ state_ref: requested }) })
+        .then(response => response.json())
+        .then(body => Promise.resolve({ body, status: 200 }))
+        .then(response => Promise.resolve(response))
+        .then(response => {
+            sdkRef = context.stateRefFromMachine(response.body.state_machine, response.body.updated_state_ref);
+            delivery.push('response');
+        });
+    const nextMachine = machine('spotify:track:next');
+    nextMachine.state_machine_id = 'next';
+    const previous = { state_machine_id: 'first', state_id: 'current', paused: false };
+    const socket = context.wsHook.after({ data: JSON.stringify({ payloads: [{
+        type: 'replace_state', prev_state_ref: previous,
+        state_machine: nextMachine, state_ref: { state_index: 0, paused: false }
+    }] }) }).then(event => {
+        const command = JSON.parse(event.data).payloads[0];
+        assert.equal(context.sameStateRef(sdkRef, command.prev_state_ref), true,
+            'The SDK would reject a replacement delivered before its predecessor response is consumed');
+        delivery.push('socket');
+    });
+    await Promise.all([first, socket]);
+    assert.deepEqual(delivery, ['response', 'socket']);
+});
+
+test('an obsolete ad response does not issue a playback-changing future request', async () => {
+    const { context, errors } = load();
+    let respond;
+    let transforms = 0;
+    const original = { state_machine: machine('spotify:ad:departed'), updated_state_ref: { state_index: 0 } };
+    context.originalFetch = () => new Promise(resolve => { respond = resolve; });
+    context.manipulateStateMachine = async value => { transforms += 1; return value; };
+    const old = { state_machine_id: 'old', state_id: 'ad' };
+    const response = context.window.fetch('https://example.test/state', { headers: {}, body: JSON.stringify({ state_ref: old }) });
+    await nextTurn();
+    context.clientStateRef = { state_machine_id: 'new', state_id: 'selected' };
+    respond({ status: 200, json: async () => original });
+    assert.equal(await (await response).json(), original);
+    assert.equal(transforms, 0);
+    assert.deepEqual(errors, []);
+    assert.equal(context.clientStateRef.state_id, 'selected');
+});
+
+test('a failed state request releases the next queued request', async () => {
+    const { context } = load();
+    let requests = 0;
+    context.originalFetch = async () => {
+        if (++requests === 1) throw Error('network failure');
+        return { status: 200, json: async () => ({}) };
+    };
+    const init = () => ({ headers: {}, body: JSON.stringify({ state_ref: null }) });
+    const first = context.window.fetch('https://example.test/state', init());
+    const second = context.window.fetch('https://example.test/state', init());
+    await assert.rejects(first, /network failure/);
+    assert.deepEqual(await (await second).json(), {});
+    assert.equal(requests, 2);
+});
+
+test('empty error responses retain their HTTP status and do not block playback requests', async () => {
+    const { context } = load();
+    for (const status of [204, 429, 502]) {
+        const response = { status, json() { assert.fail('An empty error body must not be parsed by the filter'); } };
+        context.originalFetch = async () => response;
+        assert.equal(await context.window.fetch('https://example.test/state',
+            { headers: {}, body: JSON.stringify({ state_ref: null }) }), response);
+    }
+});
+
+test('a state response is filtered once even when its JSON is requested again', async () => {
+    const { context } = load();
+    let transforms = 0;
+    context.manipulateStateMachine = async value => { transforms += 1; return value; };
+    const body = { state_machine: machine('spotify:ad:pending'), updated_state_ref: { state_index: 0 } };
+    const response = context.onStatesFetchResponseReceived('/state',
+        { body: JSON.stringify({ state_ref: null }) }, { json: async () => body });
+    assert.equal(await response.json(), await response.json());
+    assert.equal(transforms, 1);
+});
+
+test('an ad replacement with an unrelated predecessor is passed through without server mutation', async () => {
+    const { context } = load();
+    context.clientStateRef = { state_machine_id: 'new', state_id: 'selected' };
+    let transforms = 0;
+    context.manipulateStateMachine = async value => { transforms += 1; return value; };
+    const data = { payloads: [{ type: 'replace_state', prev_state_ref: { state_machine_id: 'old', state_id: 'ad' },
+        state_machine: machine('spotify:ad:departed'), state_ref: { state_index: 0 } }] };
+    const event = { data: JSON.stringify(data) };
+    const before = event.data;
+    await context.wsHook.after(event);
+    assert.equal(transforms, 0);
+    assert.equal(event.data, before);
+    const body = { commands: data.payloads };
+    const result = await context.onStatesFetchResponseReceived('/state_conflict',
+        { body: JSON.stringify({ state_ref: context.clientStateRef }) }, { json: async () => body }).json();
+    assert.equal(result, body);
+    assert.equal(transforms, 0);
+});
+
+test('ordinary music graphs are preserved by the actual removal implementation', async () => {
+    const { context } = load();
+    const value = machine();
+    value.tracks.push(track('spotify:track:next'));
+    value.states.push(state('next', 1));
+    value.states[0].transitions.advance = { state_index: 1 };
+    const before = JSON.stringify(value);
+    assert.equal(JSON.stringify(await context.manipulateStateMachine(value, 0, false)), before);
+    const event = replacementEvent(value);
+    const bytes = event.data;
+    assert.equal(await context.wsHook.after(event), event);
+    assert.equal(event.data, bytes);
 });
 
 test('ad-bearing and previously rewritten states remain serialized', async () => {
@@ -78,7 +268,7 @@ test('ad-bearing and previously rewritten states remain serialized', async () =>
     assert.equal(processed, 2);
 });
 
-test('state and Connect network requests do not wait for the ad queue', async () => {
+test('state and Connect network requests wait for the preceding playback operation', async () => {
     const { context, calls } = load();
     let release;
     const pending = context.statesManipuationQueue.enqueue(() => new Promise(resolve => { release = resolve; }));
@@ -89,14 +279,16 @@ test('state and Connect network requests do not wait for the ad queue', async ()
         context.window.fetch('https://example.test/connect-state/command', connectInit)
     ];
     try {
-        assert.equal(calls.length, 2);
-        assert.equal(calls[0].init, stateInit);
-        assert.equal(calls[1].init, connectInit);
+        await nextTurn();
+        assert.equal(calls.length, 0);
     } finally {
         release();
         await pending;
         await Promise.all(results);
     }
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].init, stateInit);
+    assert.equal(calls[1].init, connectInit);
 });
 
 test('ordinary state and conflict responses preserve the original data', async () => {

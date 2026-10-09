@@ -112,6 +112,12 @@ function stateRefFromMachine(machine, ref)
         state_id: state.state_id, paused: !!ref.paused};
 }
 
+function replacementMatchesClient(command)
+{
+    return command == null || !Object.prototype.hasOwnProperty.call(command, "prev_state_ref")
+        || sameStateRef(normalizeStateRef(command.prev_state_ref), normalizeStateRef(clientStateRef));
+}
+
 function reconcileReplacement(command)
 {
     if (command == null || command.type != "replace_state") return false;
@@ -159,6 +165,18 @@ function stateResponseNeedsFiltering(data)
     return commands != null && Object.keys(commands).some(function(key) {
         return stateMachineNeedsFiltering(commands[key] == null ? null : commands[key]["state_machine"]);
     });
+}
+
+function webSocketMessageUpdatesPlayback(messageEvent)
+{
+    try
+    {
+        var data = JSON.parse(messageEvent.data);
+        return Array.isArray(data.payloads) && data.payloads.some(function(payload) {
+            return payload != null && payload.type == "replace_state";
+        });
+    }
+    catch { return false; }
 }
 
 function webSocketMessageNeedsFiltering(messageEvent)
@@ -230,14 +248,14 @@ window.fetch = function(url, init)
 
         return originalFetch.call(window, fetchArguments.url, fetchArguments.init).then(function(response)
         {
-            // TODO: what do we do  on 429 here?
-            var modifiedResponse = onStatesFetchResponseReceived(url, init, response, requestedClientRef);
-            return modifiedResponse;
+            if (response.status != 200) return response;
+            var modifiedResponse = onStatesFetchResponseReceived(url, init, response, requestedClientRef, true);
+            return modifiedResponse.json().then(function() { return modifiedResponse; });
         });
 
         };
 
-        return promise({url: url, init: init});
+        return statesManipuationQueue.enqueue(promise, {url: url, init: init});
     }
     else if (url != undefined && url.endsWith("/devices"))
     {
@@ -268,7 +286,7 @@ window.fetch = function(url, init)
         return originalFetch.call(window, fetchArguments.url, fetchArguments.init);
         
         }
-        return promise({url: url, init: init});
+        return statesManipuationQueue.enqueue(promise, {url: url, init: init});
 
     }
     else if (url.includes("/license"))
@@ -310,6 +328,13 @@ async function onAccessTokenResponseIntercepted(accessTokenResponse)
 wsHook.after = function(messageEvent, url) 
 {
     rememberStateReplacementChannel(messageEvent);
+    if (!webSocketMessageUpdatesPlayback(messageEvent) && !webSocketMessageNeedsFiltering(messageEvent))
+        return Promise.resolve(messageEvent);
+    return statesManipuationQueue.enqueue(processWebSocketMessage, messageEvent);
+}
+
+async function processWebSocketMessage(messageEvent)
+{
     if (!webSocketMessageNeedsFiltering(messageEvent))
     {
         try
@@ -322,8 +347,6 @@ wsHook.after = function(messageEvent, url)
         catch {}
         return Promise.resolve(messageEvent);
     }
-    var promise = async function(messageEvent) {
-
     try
     {
         
@@ -343,7 +366,7 @@ wsHook.after = function(messageEvent, url)
                 //if (prevStateMachineId)
                 //   var prevStateMachineId = prevStateRef["state_machine_id"];
 
-                if (stateRef != null) 
+                if (stateRef != null && replacementMatchesClient(payload))
                 {
                     var currentStateIndex = stateRef["state_index"];
 
@@ -400,19 +423,18 @@ wsHook.after = function(messageEvent, url)
         return messageEvent;
     }
 
-    };
-
-    return statesManipuationQueue.enqueue(promise, messageEvent);
 }
 
-function onStatesFetchResponseReceived(url, init, responseBody, requestedClientRef = clientStateRef)
+function onStatesFetchResponseReceived(url, init, responseBody, requestedClientRef = clientStateRef, alreadyQueued = false)
 {
     var requestBody = init.body;
     var request = JSON.parse(requestBody);
 
     var originalJsonPromise = responseBody.json();
+    var processedJsonPromise;
     responseBody.json = function(request)
     {
+        if (processedJsonPromise != null) return processedJsonPromise;
         var promise = async function() {
         
         return originalJsonPromise.then(async function(data)
@@ -424,6 +446,11 @@ function onStatesFetchResponseReceived(url, init, responseBody, requestedClientR
             if (request.debug_source == "track_data_finalized")
             {
                 console.log("SpotiAds: Passing through ended-track finalization without changing playback");
+                return data;
+            }
+            if (!sameStateRef(clientStateRef, requestedClientRef))
+            {
+                console.log("SpotiAds: Passing through an obsolete state response without changing playback");
                 return data;
             }
             if (!stateResponseNeedsFiltering(data))
@@ -503,7 +530,8 @@ function onStatesFetchResponseReceived(url, init, responseBody, requestedClientR
                 for (var key of Object.keys(commands))
                 {
                     var command = data.commands[key];
-                    if (command == null || command.type != "replace_state" || command.state_machine == null || command.state_ref == null) continue;
+                    if (command == null || command.type != "replace_state" || command.state_machine == null || command.state_ref == null
+                        || !replacementMatchesClient(command)) continue;
                     var stateMachine = data["commands"][key]["state_machine"];           
                     var currentStateIndex = data["commands"][key]["state_ref"]["state_index"];
                     var commandType = data["commands"][key]["type"];
@@ -533,7 +561,8 @@ function onStatesFetchResponseReceived(url, init, responseBody, requestedClientR
 
         };
 
-        return statesManipuationQueue.enqueue(promise, null);
+        processedJsonPromise = alreadyQueued ? promise() : statesManipuationQueue.enqueue(promise, null);
+        return processedJsonPromise;
 
     }.bind(this, request);
     

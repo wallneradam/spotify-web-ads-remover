@@ -27,23 +27,27 @@ class PromiseQueue {
       if (!item) {
         return false;
       }
+      const advance = () => {
+        // Let the SDK consume the delivered result before starting another state update.
+        setTimeout(() => {
+          this.workingOnPromise = false;
+          this.dequeue();
+        }, 0);
+      };
       try {
         this.workingOnPromise = true;
         item.promise(item.argument)
           .then((value) => {
-            this.workingOnPromise = false;
             item.resolve(value);
-            this.dequeue();
+            advance();
           })
           .catch(err => {
-            this.workingOnPromise = false;
             item.reject(err);
-            this.dequeue();
+            advance();
           })
       } catch (err) {
-        this.workingOnPromise = false;
         item.reject(err);
-        this.dequeue();
+        advance();
       }
       return true;
     }

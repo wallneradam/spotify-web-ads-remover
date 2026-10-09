@@ -12,11 +12,19 @@ Possibly [here](https://github.com/tomer8007/spotify-web-ads-remover/pull/2) and
 
 ## Playback compatibility fixes in this fork
 
-The player keeps the intended post-ad track when a future-state response points
-at a different track index. After obtaining an ad-free future state it does not
-request restoration of the original ad-bearing machine. Ordinary WebSocket
-updates and outgoing state/Connect requests bypass the ad-processing queue;
-ad-bearing and previously rewritten states still use the removal path.
+Future-state discovery uses Spotify's returned current-state index. Its
+`PUT /state` request changes server playback, so discovery waits until the ad is
+current and avoids a second resume of an already returned music placeholder.
+The filter does not restore the original ad-bearing machine.
+
+Playback replacements and state/Connect requests share a queue. A state request
+finishes response filtering before the next playback operation starts. Queue
+delivery yields one event-loop turn so the SDK can consume the response before
+a following replacement arrives. Ordinary music graphs
+pass through unchanged; non-playback socket traffic does not wait for the queue.
+Obsolete responses and replacements with an unrelated predecessor do not trigger
+playback-changing ad discovery. Late ad replacement waits for the SDK to confirm
+its new music load before releasing the response.
 
 Run the dependency-free regression tests with Node.js 18 or later:
 

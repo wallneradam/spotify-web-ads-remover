@@ -64,15 +64,7 @@
 					return;
 				}
 			
-				var interceptedEvent = new MutableMessageEvent(event);
-                interceptedEvent.dispatchReplacement = function(data) {
-                    if (WSObject.readyState !== _WS.OPEN || !onmessageFunction) return false;
-                    var replacement = new MutableMessageEvent(event);
-                    replacement.data = JSON.stringify(data);
-                    onmessageFunction.call(WSObject, replacement);
-                    return true;
-                };
-                wsHook.after(interceptedEvent, this.url).then(function(modifiedEvent)
+				wsHook.after(new MutableMessageEvent(event), this.url).then(function(modifiedEvent)
 				{
 					if (modifiedEvent != null)
 						onmessageFunction.apply(this, [modifiedEvent]);

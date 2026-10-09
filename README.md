@@ -10,30 +10,19 @@ The states are modified so that states that represent ads are skipped over (poin
 ## Firefox/Safari Support
 Possibly [here](https://github.com/tomer8007/spotify-web-ads-remover/pull/2) and [there](https://github.com/tomer8007/spotify-web-ads-remover/pull/8).
 
-## Playback compatibility fixes in this fork
+## Playback synchronization in this fork
 
-Future-state discovery uses Spotify's returned current-state index. Its
-`PUT /state` request changes server playback, so discovery waits until the ad is
-current and avoids a second resume of an already returned music placeholder.
-The filter does not restore the original ad-bearing machine.
+The final state-restoration request is awaited before state manipulation finishes.
+This keeps the next queued operation from starting while restoration is still in
+flight. The upstream state manipulation algorithm is otherwise unchanged.
 
-Playback replacements and state/Connect requests share a queue. A state request
-finishes response filtering before the next playback operation starts. Queue
-delivery yields one event-loop turn so the SDK can consume the response before
-a following replacement arrives. Ordinary music graphs
-pass through unchanged; non-playback socket traffic does not wait for the queue.
-Obsolete responses and replacements with an unrelated predecessor do not trigger
-playback-changing ad discovery. Late ad replacement waits for the SDK to confirm
-its new music load before releasing the response.
-
-Run the dependency-free regression tests with Node.js 18 or later:
+Run the focused regression tests with Node.js 18 or later:
 
 ```sh
 node --test tests/*.test.cjs
 ```
 
-These tests cover state selection, request ordering, and preservation of ad
-processing. They do not replace testing against a signed-in Spotify player.
+The script retains the existing compatibility marker for installed embedding apps.
 
 ## Privacy policy
 No data is ever transmitted to anywhere. No backend, no analytics, no server.
